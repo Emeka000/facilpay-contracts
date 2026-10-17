@@ -32,6 +32,11 @@ pub enum Error {
     AlreadyApproved = 10,
     ThresholdNotMet = 11,
     MultisigRequired = 12,
+    // #820: bounded emergency pause
+    NoPauseExpiry = 13,
+    PauseNotExpired = 14,
+    PauseExpired = 15,
+    InvalidPauseDuration = 16,
 }
 
 #[contracttype]
@@ -54,6 +59,8 @@ pub enum DataKey {
     Threshold,
     ProposalCount,
     Proposal(u64),
+    // #820: timestamp at which the current emergency pause may be expired.
+    EmergencyPauseExpiry,
 }
 
 /// A privileged coordinator action that goes through propose/approve/execute (#816).
@@ -161,6 +168,24 @@ pub struct EmergencyFunctionUnpausedEvent {
     pub unpaused_at: u64,
 }
 
+/// Emitted when an admin pushes back the expiry of a bounded emergency pause (#820).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPauseExtended {
+    pub extended_by: Address,
+    pub previous_expires_at: u64,
+    pub new_expires_at: u64,
+}
+
+/// Emitted when a bounded emergency pause is lifted by `expire_emergency_pause`
+/// rather than by the pauser (#820).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPauseAutoExpired {
+    pub expires_at: u64,
+    pub unpaused_at: u64,
+}
+
 /// Verifies `pauser` is authenticated and matches the stored pauser.
 fn require_pauser(env: &Env, pauser: &Address) -> Result<(), Error> {
     pauser.require_auth();
@@ -187,6 +212,31 @@ fn child_contract(env: &Env, target: ChildKind) -> Result<Address, Error> {
         .instance()
         .get(&key)
         .ok_or(Error::NotInitialized)
+}
+
+/// Returns the stored (payment, escrow, refund) child contract addresses.
+fn child_contracts(env: &Env) -> Result<(Address, Address, Address), Error> {
+    Ok((
+        child_contract(env, ChildKind::Payment)?,
+        child_contract(env, ChildKind::Escrow)?,
+        child_contract(env, ChildKind::Refund)?,
+    ))
+}
+
+/// Calls `unpause_contract(pauser)` on every child contract.
+fn unpause_children(env: &Env, pauser: &Address) -> Result<(), Error> {
+    let (payment, escrow, refund) = child_contracts(env)?;
+    PaymentContractClient::new(env, &payment).unpause_contract(pauser);
+    EscrowContractClient::new(env, &escrow).unpause_contract(pauser);
+    RefundContractClient::new(env, &refund).unpause_contract(pauser);
+    Ok(())
+}
+
+fn load_pause_expiry(env: &Env) -> Result<u64, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyPauseExpiry)
+        .ok_or(Error::NoPauseExpiry)
 }
 
 /// Returns the admin set. Contracts initialized before #816 only stored a
@@ -402,45 +452,53 @@ impl AdminContract {
     /// # Parameters
     /// - `pauser`: the pauser address that must be authorized.
     /// - `reason`: a human-readable explanation for the emergency pause.
+    /// - `max_pause_seconds`: if `Some(n)`, the pause may be lifted by anyone via
+    ///   `expire_emergency_pause` once `n` seconds have passed (#820). `None`
+    ///   pauses with no expiry and clears any expiry left by an earlier pause.
     ///
     /// # Returns
     /// Returns `Ok(())` when all child contracts are paused successfully.
     ///
     /// # Errors
     /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
-    /// and `Error::Unauthorized` if the provided pauser address does not match the
-    /// stored pauser.
-    pub fn emergency_pause_all(env: Env, pauser: Address, reason: String) -> Result<(), Error> {
-        pauser.require_auth();
+    /// `Error::Unauthorized` if the provided pauser address does not match the
+    /// stored pauser, and `Error::InvalidPauseDuration` if `max_pause_seconds` is
+    /// `Some(0)` or overflows the ledger timestamp.
+    pub fn emergency_pause_all(
+        env: Env,
+        pauser: Address,
+        reason: String,
+        max_pause_seconds: Option<u64>,
+    ) -> Result<(), Error> {
+        require_pauser(&env, &pauser)?;
 
-        let stored_pauser: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Pauser)
-            .ok_or(Error::NotInitialized)?;
-        if pauser != stored_pauser {
-            return Err(Error::Unauthorized);
-        }
+        let expires_at = match max_pause_seconds {
+            Some(0) => return Err(Error::InvalidPauseDuration),
+            Some(seconds) => Some(
+                env.ledger()
+                    .timestamp()
+                    .checked_add(seconds)
+                    .ok_or(Error::InvalidPauseDuration)?,
+            ),
+            None => None,
+        };
 
-        let payment_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PaymentContract)
-            .ok_or(Error::NotInitialized)?;
-        let escrow_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowContract)
-            .ok_or(Error::NotInitialized)?;
-        let refund_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::RefundContract)
-            .ok_or(Error::NotInitialized)?;
+        let (payment_contract, escrow_contract, refund_contract) = child_contracts(&env)?;
 
         PaymentContractClient::new(&env, &payment_contract).pause_contract(&pauser, &reason);
         EscrowContractClient::new(&env, &escrow_contract).pause_contract(&pauser, &reason);
         RefundContractClient::new(&env, &refund_contract).pause_contract(&pauser, &reason);
+
+        match expires_at {
+            Some(expires_at) => env
+                .storage()
+                .instance()
+                .set(&DataKey::EmergencyPauseExpiry, &expires_at),
+            None => env
+                .storage()
+                .instance()
+                .remove(&DataKey::EmergencyPauseExpiry),
+        }
 
         Ok(())
     }
@@ -458,38 +516,106 @@ impl AdminContract {
     /// and `Error::Unauthorized` if the provided pauser address does not match the
     /// stored pauser.
     pub fn emergency_unpause_all(env: Env, pauser: Address) -> Result<(), Error> {
-        pauser.require_auth();
+        require_pauser(&env, &pauser)?;
+        unpause_children(&env, &pauser)?;
+        env.storage()
+            .instance()
+            .remove(&DataKey::EmergencyPauseExpiry);
+        Ok(())
+    }
 
-        let stored_pauser: Address = env
+    /// Pushes back the expiry of a bounded emergency pause (#820).
+    ///
+    /// # Parameters
+    /// - `admin`: an admin-set member, who must authorize the call.
+    /// - `additional_seconds`: how far to move the expiry forward; must be non-zero.
+    ///
+    /// # Returns
+    /// The new expiry timestamp.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
+    /// `Error::Unauthorized` if `admin` is not in the admin set,
+    /// `Error::NoPauseExpiry` if there is no bounded pause in effect,
+    /// `Error::PauseExpired` if the expiry has already been reached, and
+    /// `Error::InvalidPauseDuration` if `additional_seconds` is 0 or overflows.
+    ///
+    /// # Events
+    /// Emits `EmergencyPauseExtended`.
+    pub fn extend_emergency_pause(
+        env: Env,
+        admin: Address,
+        additional_seconds: u64,
+    ) -> Result<u64, Error> {
+        require_admin_member(&env, &admin)?;
+        let expires_at = load_pause_expiry(&env)?;
+        if env.ledger().timestamp() >= expires_at {
+            return Err(Error::PauseExpired);
+        }
+        if additional_seconds == 0 {
+            return Err(Error::InvalidPauseDuration);
+        }
+        let new_expires_at = expires_at
+            .checked_add(additional_seconds)
+            .ok_or(Error::InvalidPauseDuration)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPauseExpiry, &new_expires_at);
+
+        EmergencyPauseExtended {
+            extended_by: admin,
+            previous_expires_at: expires_at,
+            new_expires_at,
+        }
+        .publish(&env);
+
+        Ok(new_expires_at)
+    }
+
+    /// Lifts a bounded emergency pause once its expiry has been reached (#820).
+    ///
+    /// Anyone may call this: the coordinator does not check the caller. It
+    /// calls `unpause_contract(pauser)` on each child with the stored pauser,
+    /// so each child still verifies the pauser's authorization for that call.
+    ///
+    /// # Errors
+    /// Returns `Error::NoPauseExpiry` if there is no bounded pause in effect,
+    /// `Error::PauseNotExpired` if the expiry has not been reached yet, and
+    /// `Error::NotInitialized` if the pauser or a child address is missing.
+    ///
+    /// # Events
+    /// Emits `EmergencyPauseAutoExpired`.
+    pub fn expire_emergency_pause(env: Env) -> Result<(), Error> {
+        let expires_at = load_pause_expiry(&env)?;
+        let now = env.ledger().timestamp();
+        if now < expires_at {
+            return Err(Error::PauseNotExpired);
+        }
+
+        let pauser: Address = env
             .storage()
             .instance()
             .get(&DataKey::Pauser)
             .ok_or(Error::NotInitialized)?;
-        if pauser != stored_pauser {
-            return Err(Error::Unauthorized);
+        unpause_children(&env, &pauser)?;
+        env.storage()
+            .instance()
+            .remove(&DataKey::EmergencyPauseExpiry);
+
+        EmergencyPauseAutoExpired {
+            expires_at,
+            unpaused_at: now,
         }
-
-        let payment_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PaymentContract)
-            .ok_or(Error::NotInitialized)?;
-        let escrow_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowContract)
-            .ok_or(Error::NotInitialized)?;
-        let refund_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::RefundContract)
-            .ok_or(Error::NotInitialized)?;
-
-        PaymentContractClient::new(&env, &payment_contract).unpause_contract(&pauser);
-        EscrowContractClient::new(&env, &escrow_contract).unpause_contract(&pauser);
-        RefundContractClient::new(&env, &refund_contract).unpause_contract(&pauser);
+        .publish(&env);
 
         Ok(())
+    }
+
+    /// Returns when the current emergency pause may be expired, or `None` if
+    /// no bounded pause is in effect (#820).
+    pub fn get_emergency_pause_expiry(env: Env) -> Option<u64> {
+        env.storage().instance().get(&DataKey::EmergencyPauseExpiry)
     }
 
     /// Pauses a single function on one child contract, leaving every other
@@ -978,7 +1104,7 @@ mod test {
         );
 
         let reason = String::from_str(&env, "security incident");
-        client.emergency_pause_all(&pauser, &reason);
+        client.emergency_pause_all(&pauser, &reason, &None);
         client.emergency_unpause_all(&pauser);
     }
 
@@ -1052,7 +1178,7 @@ mod test {
         let refund = RefundContractClient::new(&env, &refund_contract);
 
         let reason = String::from_str(&env, "security incident");
-        client.emergency_pause_all(&pauser, &reason);
+        client.emergency_pause_all(&pauser, &reason, &None);
 
         assert!(payment.get_pause_state().globally_paused);
         assert!(escrow.get_pause_state().globally_paused);
@@ -1077,7 +1203,7 @@ mod test {
         let someone = Address::generate(&env);
         let reason = String::from_str(&env, "incident");
         assert_eq!(
-            fresh.try_emergency_pause_all(&someone, &reason),
+            fresh.try_emergency_pause_all(&someone, &reason, &None),
             Err(Ok(Error::NotInitialized))
         );
         assert_eq!(
@@ -1088,7 +1214,7 @@ mod test {
         // Initialized contract rejects anyone but the stored pauser, including the admin.
         let (client, admin, _pauser, payment_contract, _, _) = setup_initialized(&env);
         assert_eq!(
-            client.try_emergency_pause_all(&admin, &reason),
+            client.try_emergency_pause_all(&admin, &reason, &None),
             Err(Ok(Error::Unauthorized))
         );
         assert_eq!(
@@ -1140,7 +1266,7 @@ mod test {
         client.set_refund_contract(&admin, &new_refund);
 
         // Pausing now targets the new contracts and leaves the old ones untouched.
-        client.emergency_pause_all(&pauser, &String::from_str(&env, "rotation"));
+        client.emergency_pause_all(&pauser, &String::from_str(&env, "rotation"), &None);
 
         assert!(
             PaymentContractClient::new(&env, &new_payment)
@@ -1464,7 +1590,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
         let (client, _, _, _, pauser) = setup_multisig(&env);
-        client.emergency_pause_all(&pauser, &String::from_str(&env, "incident"));
+        client.emergency_pause_all(&pauser, &String::from_str(&env, "incident"), &None);
         let payment = PaymentContractClient::new(&env, &client.get_contracts().payment);
         assert!(payment.get_pause_state().globally_paused);
     }
@@ -1508,5 +1634,267 @@ mod test {
                 refund: None,
             }
         );
+    }
+
+    // ── #820: bounded emergency pause ──────────────────────────────────────
+
+    const PAUSE_SECONDS: u64 = 3_600;
+
+    fn has_event(env: &Env, name: &str) -> bool {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::{Symbol, TryFromVal};
+        let expected = Symbol::new(env, name);
+        env.events().all().iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(env, &t).ok())
+                .is_some_and(|s| s == expected)
+        })
+    }
+
+    fn all_paused(env: &Env, client: &AdminContractClient<'_>) -> [bool; 3] {
+        let contracts = client.get_contracts();
+        [
+            PaymentContractClient::new(env, &contracts.payment)
+                .get_pause_state()
+                .globally_paused,
+            EscrowContractClient::new(env, &contracts.escrow)
+                .get_pause_state()
+                .globally_paused,
+            RefundContractClient::new(env, &contracts.refund)
+                .get_pause_state()
+                .globally_paused,
+        ]
+    }
+
+    fn set_time(env: &Env, timestamp: u64) {
+        env.ledger().with_mut(|l| l.timestamp = timestamp);
+    }
+
+    #[test]
+    fn test_bounded_pause_cannot_expire_early_and_auto_unpauses_after() {
+        let env = Env::default();
+        // The children check the pauser's auth on a non-root call.
+        env.mock_all_auths_allowing_non_root_auth();
+        set_time(&env, 1_000);
+        let (client, _, pauser, _, _, _) = setup_initialized(&env);
+
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "incident"),
+            &Some(PAUSE_SECONDS),
+        );
+        let expires_at = 1_000 + PAUSE_SECONDS;
+        assert_eq!(client.get_emergency_pause_expiry(), Some(expires_at));
+        assert_eq!(all_paused(&env, &client), [true; 3]);
+
+        set_time(&env, expires_at - 1);
+        assert_eq!(
+            client.try_expire_emergency_pause(),
+            Err(Ok(Error::PauseNotExpired))
+        );
+        assert_eq!(all_paused(&env, &client), [true; 3]);
+
+        set_time(&env, expires_at);
+        client.expire_emergency_pause();
+        assert!(has_event(&env, "emergency_pause_auto_expired"));
+        assert_eq!(all_paused(&env, &client), [false; 3]);
+        assert_eq!(client.get_emergency_pause_expiry(), None);
+
+        // The expiry is consumed; a second call has nothing to expire.
+        assert_eq!(
+            client.try_expire_emergency_pause(),
+            Err(Ok(Error::NoPauseExpiry))
+        );
+    }
+
+    #[test]
+    fn test_expire_needs_no_caller_auth_only_the_childrens_pauser_auth() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, pauser, payment, escrow, refund) = setup_initialized(&env);
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "incident"),
+            &Some(PAUSE_SECONDS),
+        );
+        set_time(&env, env.ledger().timestamp() + PAUSE_SECONDS);
+
+        // Only the children's own `unpause_contract(pauser)` checks are
+        // authorized; nothing authorizes the top-level call itself.
+        let args: Vec<soroban_sdk::Val> = (pauser.clone(),).into_val(&env);
+        let invoke = |contract| MockAuthInvoke {
+            contract,
+            fn_name: "unpause_contract",
+            args: args.clone(),
+            sub_invokes: &[],
+        };
+        let (payment_invoke, escrow_invoke, refund_invoke) =
+            (invoke(&payment), invoke(&escrow), invoke(&refund));
+        env.mock_auths(&[
+            MockAuth {
+                address: &pauser,
+                invoke: &payment_invoke,
+            },
+            MockAuth {
+                address: &pauser,
+                invoke: &escrow_invoke,
+            },
+            MockAuth {
+                address: &pauser,
+                invoke: &refund_invoke,
+            },
+        ]);
+
+        client.expire_emergency_pause();
+        assert_eq!(all_paused(&env, &client), [false; 3]);
+    }
+
+    #[test]
+    fn test_unbounded_pause_has_no_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, pauser, _, _, _) = setup_initialized(&env);
+
+        client.emergency_pause_all(&pauser, &String::from_str(&env, "incident"), &None);
+        assert_eq!(client.get_emergency_pause_expiry(), None);
+
+        set_time(&env, env.ledger().timestamp() + 365 * 24 * 60 * 60);
+        assert_eq!(
+            client.try_expire_emergency_pause(),
+            Err(Ok(Error::NoPauseExpiry))
+        );
+        assert_eq!(
+            client.try_extend_emergency_pause(&admin, &PAUSE_SECONDS),
+            Err(Ok(Error::NoPauseExpiry))
+        );
+        assert_eq!(all_paused(&env, &client), [true; 3]);
+    }
+
+    #[test]
+    fn test_zero_max_pause_seconds_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, pauser, _, _, _) = setup_initialized(&env);
+
+        assert_eq!(
+            client.try_emergency_pause_all(&pauser, &String::from_str(&env, "incident"), &Some(0)),
+            Err(Ok(Error::InvalidPauseDuration))
+        );
+        assert_eq!(all_paused(&env, &client), [false; 3]);
+        assert_eq!(client.get_emergency_pause_expiry(), None);
+    }
+
+    #[test]
+    fn test_admin_extends_pause_before_expiry() {
+        let env = Env::default();
+        // The children check the pauser's auth on a non-root call.
+        env.mock_all_auths_allowing_non_root_auth();
+        set_time(&env, 1_000);
+        let (client, admin, pauser, _, _, _) = setup_initialized(&env);
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "incident"),
+            &Some(PAUSE_SECONDS),
+        );
+        let expires_at = 1_000 + PAUSE_SECONDS;
+
+        set_time(&env, expires_at - 1);
+        let new_expires_at = client.extend_emergency_pause(&admin, &PAUSE_SECONDS);
+        assert_eq!(new_expires_at, expires_at + PAUSE_SECONDS);
+        assert!(has_event(&env, "emergency_pause_extended"));
+        assert!(!has_event(&env, "emergency_pause_auto_expired"));
+        assert_eq!(client.get_emergency_pause_expiry(), Some(new_expires_at));
+
+        // The original expiry no longer lifts the pause.
+        set_time(&env, expires_at);
+        assert_eq!(
+            client.try_expire_emergency_pause(),
+            Err(Ok(Error::PauseNotExpired))
+        );
+        assert_eq!(all_paused(&env, &client), [true; 3]);
+
+        set_time(&env, new_expires_at);
+        client.expire_emergency_pause();
+        assert_eq!(all_paused(&env, &client), [false; 3]);
+    }
+
+    #[test]
+    fn test_extend_rejects_non_admin_zero_and_expired_pause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (client, admin, pauser, _, _, _) = setup_initialized(&env);
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "incident"),
+            &Some(PAUSE_SECONDS),
+        );
+        let expires_at = 1_000 + PAUSE_SECONDS;
+
+        // Only admin-set members may extend; the pauser is not one.
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_extend_emergency_pause(&pauser, &PAUSE_SECONDS),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            client.try_extend_emergency_pause(&stranger, &PAUSE_SECONDS),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            client.try_extend_emergency_pause(&admin, &0),
+            Err(Ok(Error::InvalidPauseDuration))
+        );
+        assert_eq!(client.get_emergency_pause_expiry(), Some(expires_at));
+
+        // Once the expiry is reached it can no longer be extended.
+        set_time(&env, expires_at);
+        assert_eq!(
+            client.try_extend_emergency_pause(&admin, &PAUSE_SECONDS),
+            Err(Ok(Error::PauseExpired))
+        );
+    }
+
+    #[test]
+    fn test_any_multisig_member_can_extend() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, a2, _, pauser) = setup_multisig(&env);
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "incident"),
+            &Some(PAUSE_SECONDS),
+        );
+        let expires_at = client.get_emergency_pause_expiry().unwrap();
+
+        assert_eq!(
+            client.extend_emergency_pause(&a2, &PAUSE_SECONDS),
+            expires_at + PAUSE_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_manual_unpause_and_unbounded_repause_clear_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, pauser, _, _, _) = setup_initialized(&env);
+        let reason = String::from_str(&env, "incident");
+
+        client.emergency_pause_all(&pauser, &reason, &Some(PAUSE_SECONDS));
+        client.emergency_unpause_all(&pauser);
+        assert_eq!(client.get_emergency_pause_expiry(), None);
+        assert_eq!(
+            client.try_expire_emergency_pause(),
+            Err(Ok(Error::NoPauseExpiry))
+        );
+
+        client.emergency_pause_all(&pauser, &reason, &Some(PAUSE_SECONDS));
+        client.emergency_unpause_all(&pauser);
+        client.emergency_pause_all(&pauser, &reason, &None);
+        assert_eq!(client.get_emergency_pause_expiry(), None);
     }
 }

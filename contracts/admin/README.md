@@ -24,7 +24,7 @@ The contract defines two distinct roles, both stored in instance storage and bot
 - The pauser is a single `Address` stored in contract instance storage under the `Pauser` data key.
 - It is set during `initialize` alongside the admin and cannot be changed after initialization.
 - The pauser stays a **single key** even when the admin set is a multisig, so emergency response stays fast.
-- The pauser is the only role allowed to call `emergency_pause_all`, `emergency_unpause_all`, `emergency_pause_function` and `emergency_unpause_function`.
+- The pauser is the only role allowed to call `emergency_pause_all`, `emergency_unpause_all`, `emergency_pause_function` and `emergency_unpause_function`. A bounded pause can also be lifted by anyone through `expire_emergency_pause` once it has reached its expiry, and extended by an admin-set member through `extend_emergency_pause` (see [Bounded Emergency Pause](#bounded-emergency-pause)).
 - The pauser address must also be an admin/multisig member of each child contract. Otherwise the child contract's `pause_contract` / `unpause_contract` / `pause_function` / `unpause_function` call rejects the pauser and the emergency call fails.
 
 ### Permission Checks
@@ -39,8 +39,10 @@ Every privileged function performs two authorization checks:
 | Function | Description | Role Required |
 |---|---|---|
 | `initialize(admin, pauser, payment_contract, escrow_contract, refund_contract)` | Configures the contract with the admin, pauser, and child contract addresses. | Admin (sets both roles) |
-| `emergency_pause_all(pauser, reason)` | Pauses the payment, escrow, and refund contracts in one call. | Pauser |
-| `emergency_unpause_all(pauser)` | Unpauses the payment, escrow, and refund contracts in one call. | Pauser |
+| `emergency_pause_all(pauser, reason, max_pause_seconds)` | Pauses the payment, escrow, and refund contracts in one call, optionally with an expiry. See [Bounded Emergency Pause](#bounded-emergency-pause). | Pauser |
+| `emergency_unpause_all(pauser)` | Unpauses the payment, escrow, and refund contracts in one call and clears any pause expiry. | Pauser |
+| `extend_emergency_pause(admin, additional_seconds)` | Pushes back the expiry of a bounded pause before it is reached. | Admin member (any threshold) |
+| `expire_emergency_pause()` | Unpauses all children once a bounded pause has reached its expiry. | Anyone (children still check the pauser, see below) |
 | `emergency_pause_function(pauser, target, function_name, reason)` | Pauses one function on the targeted child contract only. | Pauser |
 | `emergency_unpause_function(pauser, target, function_name)` | Unpauses one function on the targeted child contract only. | Pauser |
 | `set_payment_contract(admin, payment_contract)` | Updates the stored payment contract address. | Admin member, threshold 1 only |
@@ -59,6 +61,7 @@ Every privileged function performs two authorization checks:
 | `get_admins()` | The admin set. `NotInitialized` before `initialize`. | `Vec<Address>` |
 | `get_threshold()` | The signature threshold. `NotInitialized` before `initialize`. | `u32` |
 | `get_proposal(proposal_id)` | A proposal by id. `ProposalNotFound` if unknown. | `AdminProposal` |
+| `get_emergency_pause_expiry()` | When the current bounded pause may be expired, or `None` if no bounded pause is in effect. | `Option<u64>` |
 | `get_schema_version()` | The coordinator's own schema version (`ADMIN_SCHEMA_VERSION`). | `u32` |
 | `get_platform_versions()` | The coordinator's version and each child's `get_schema_version`. See [Platform Versions](#platform-versions). | `PlatformVersions` |
 | `get_platform_status()` | Returns the current pause state of all three child contracts. If a child contract is unreachable, it is reported as `Unknown` rather than causing a panic. | `PlatformStatus` containing the address and pause status of each child. |
@@ -98,6 +101,10 @@ Each field is a `ChildContractStatus` enum that can be:
 | 10 | `AlreadyApproved` | The approver has already approved this proposal. |
 | 11 | `ThresholdNotMet` | `execute_action` was called with fewer valid approvals than the threshold. |
 | 12 | `MultisigRequired` | A direct privileged call was made while the threshold is above 1; use a proposal instead. |
+| 13 | `NoPauseExpiry` | `extend_emergency_pause` / `expire_emergency_pause` was called with no bounded pause in effect. |
+| 14 | `PauseNotExpired` | `expire_emergency_pause` was called before the pause expiry. |
+| 15 | `PauseExpired` | `extend_emergency_pause` was called at or after the pause expiry. |
+| 16 | `InvalidPauseDuration` | `max_pause_seconds` is `Some(0)`, `additional_seconds` is 0, or the new expiry overflows `u64`. |
 
 ## Multisig Admin
 
@@ -187,6 +194,50 @@ pub struct PlatformVersions {
 - No parameters, no auth.
 - **Never fails:** a child whose address is not set (for example before `initialize`), or whose call fails, is reported as `None` instead of reverting.
 - Errors: none. Events: none.
+
+## Bounded Emergency Pause
+
+A forgotten emergency pause could otherwise freeze the platform indefinitely. `emergency_pause_all` can be given a maximum duration, after which anyone may lift the pause.
+
+### `emergency_pause_all(pauser, reason, max_pause_seconds)`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `pauser` | `Address` | Must authorize the call and match the stored pauser. |
+| `reason` | `String` | Human-readable reason, passed to each child's `pause_contract`. |
+| `max_pause_seconds` | `Option<u64>` | `Some(n)`: the pause may be expired once the ledger timestamp reaches `now + n`. `None`: no expiry; any expiry left by an earlier pause is cleared. |
+
+Errors: `NotInitialized`, `Unauthorized`, `InvalidPauseDuration` (`Some(0)` or overflow). Calling it again while paused replaces the expiry.
+
+### `extend_emergency_pause(admin, additional_seconds) -> u64`
+
+Moves the expiry forward by `additional_seconds` and returns the new expiry. Allowed only while `now < expiry`. Any single admin-set member may extend, even when the threshold is above 1, because extending only keeps the platform paused, and the pauser can still lift the pause at any time with `emergency_unpause_all`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Admin-set member. Must authorize. |
+| `additional_seconds` | `u64` | Seconds to add to the current expiry. Must be non-zero. |
+
+Errors: `NotInitialized`, `Unauthorized`, `NoPauseExpiry`, `PauseExpired`, `InvalidPauseDuration`. Event: `EmergencyPauseExtended`.
+
+### `expire_emergency_pause()`
+
+Once `now >= expiry`, calls `unpause_contract(pauser)` on the payment, escrow and refund contracts, clears the expiry and emits `EmergencyPauseAutoExpired`. The pause is no longer bounded afterwards, so a second call returns `NoPauseExpiry`.
+
+The coordinator does not check who calls it. Each child contract still checks the **pauser's** authorization on its own `unpause_contract` call. The transaction must therefore carry the pauser's authorization entries for those three child calls. Those calls are not the root of the call tree, so the entries are non-root authorizations. The pauser can sign them in advance so that a keeper or any other account can submit the transaction. A signature can only be valid for as long as the network's maximum signature-expiration window allows.
+
+Errors: `NoPauseExpiry`, `PauseNotExpired`, `NotInitialized`. Event: `EmergencyPauseAutoExpired`.
+
+`emergency_unpause_all` also clears the expiry, so a pause the pauser lifts manually cannot be "expired" later.
+
+### Events
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `EmergencyPauseExtended` | `extended_by: Address`, `previous_expires_at: u64`, `new_expires_at: u64` | `extend_emergency_pause` |
+| `EmergencyPauseAutoExpired` | `expires_at: u64`, `unpaused_at: u64` | `expire_emergency_pause` |
+
+`EmergencyPauseAutoExpired` is distinct from the children's own unpause events, so indexers can tell an automatic expiry from a manual `emergency_unpause_all`.
 
 ## Function-Level Emergency Pause
 

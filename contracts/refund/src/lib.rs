@@ -11118,3 +11118,6 @@ mod test_voucher_partial_redemption;
 
 #[cfg(test)]
 mod test_upgrade;
+
+#[cfg(test)]
+mod test_refund_reserve;

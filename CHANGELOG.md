@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded emergency pause (#820)** — `emergency_pause_all` can set a maximum pause duration. Once it is reached, anyone may call `expire_emergency_pause()` to unpause all child contracts, which emits `EmergencyPauseAutoExpired`. Admin-set members can push the expiry back with `extend_emergency_pause(admin, additional_seconds)` before it is reached, and `get_emergency_pause_expiry()` returns the current expiry.
+
 - **Refund contract in-place upgrades (#643)** — `upgrade(admin, new_wasm_hash)` replaces the refund contract's WASM without changing its address or storage, gated by the refund admin, and emits `ContractUpgraded`.
 
 - **Merchant-initiated payment requests (#662)** — `create_payment_request`, `pay_payment_request`, `cancel_payment_request` and `get_payment_request` let merchants issue invoice links that a customer (optionally a specific one) pays exactly once, before expiry.
@@ -24,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md** — Vulnerability disclosure policy and security contact information for responsible security research.
 
 ### Changed
+
+- **Admin `emergency_pause_all` signature (Breaking, #820)** — Now `emergency_pause_all(pauser, reason, max_pause_seconds: Option<u64>)`. Pass `None` to keep the previous, unbounded behaviour.
 
 - **Payment storage tiers (Breaking, #648)** — Per-record and per-user payment contract data moved from instance to persistent storage, with TTL extended on read and write. Schema version is now `2`. v1 deployments holding data are not migrated in place; see [docs/STORAGE_VERSIONING.md](docs/STORAGE_VERSIONING.md).
 

@@ -13547,3 +13547,9 @@ mod token_fee_config_test;
 
 #[cfg(test)]
 mod feat_687_688_689_690_test;
+
+#[cfg(test)]
+mod insurance_watchdog_test;
+
+#[cfg(test)]
+mod oracle_conditional_test;
